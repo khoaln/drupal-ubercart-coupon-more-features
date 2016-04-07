@@ -1,0 +1,4 @@
+name = K E-Commerce
+description = Provide additional commerce feature for Ubercart
+package = K.Ecom
+core = 6.x

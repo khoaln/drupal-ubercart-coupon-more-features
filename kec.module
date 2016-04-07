@@ -1,0 +1,840 @@
+<?php
+
+/*
+ * hook_uc_coupon_validate()
+ */
+function kec_uc_coupon_validate(&$coupon, $order, $account) {
+  // Check purchaser_email.
+  if (isset($coupon->data['purchaser_email'])) {
+    if (!$account || $account->mail != $coupon->data['purchaser_email']) {
+      return t('Your user email is not allowed to use this coupon.');
+    }
+  }
+
+  if ($coupon->type == 'price') { // if this is a price coupon
+    $subtotal = 0;
+    $discount_total = 0;
+    foreach ($order->products as $product) {
+      if (!empty($product->nid)) {
+        $subtotal += $product->price * $product->qty;
+      }
+
+      // do not include discount on "price" coupon amount
+      $node = node_load($product->nid);
+      $discounts = get_codeless_discounts_for_product_and_quantity($node, $product->qty);
+      foreach ($discounts as $discount) {
+        $discount_total += $discount->amount;
+      }
+    }
+
+    $after_discount = $subtotal - $discount_total;
+    $coupon->amount = min($after_discount, $coupon->value);
+  
+    return NULL;  // $$ coupons can be used on anything
+  }
+  else {
+    $items = uc_coupon_calculate_discounts($coupon, $order);
+    if (!is_array($items)) {  // there were no applicable items
+      return NULL;
+    }
+
+    $coupon_amount = 0;
+    foreach ($items as $item) {
+      $node = node_load($item->nid);
+      $discounted_price = uc_discounts_get_discounted_price_for_product($node, FALSE);
+
+      $percent = round($discounted_price / $item->price, 9);
+      if ($percent >= (float)0.8) { // not have more than 20% off
+        $coupon_amount += $item->discount;
+      }
+    }
+
+    $coupon->amount = $coupon_amount;
+  }
+
+  return NULL;
+}
+
+/**
+ * hook_menu()
+ */
+function kec_menu() {
+  $items = array();
+
+  $items['admin/store/coupons/add-from-csv'] = array(
+    'title' => t('Add coupons from CSV'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('kec_uc_coupon_add_form'),
+    'type' => MENU_NORMAL_ITEM,
+    'access arguments' => array('manage store coupons'),
+    'weight' => 2,
+  );
+
+  $items['admin/store/coupons'] = array(
+    'title' => 'Coupons',
+    'description' => 'Manage store discount coupons.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('kec_uc_coupon_display_form'),
+    'access arguments' => array('view store coupons'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['admin/store/reports/coupon'] = array(
+    'title' => 'Coupon usage reports',
+    'description' => 'View coupon usage reports.',
+    'page callback' => 'kec_uc_coupon_reports',
+    'access arguments' => array('view reports'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+
+  return $items;
+}
+
+function kec_uc_coupon_reports_form(&$form_state, $start = NULL, $end = NULL, $statuses = NULL, $code = NULL) {
+  module_load_include('inc', 'uc_coupon', 'uc_coupon.admin');
+
+  if (is_null($start)) {
+    $start = time();
+  }
+  if (is_null($end)) {
+    $end = time();
+  }
+  if (is_null($statuses)) {
+    $statuses = variable_get('uc_reports_reported_statuses', array('completed'));
+  }
+  if (is_null($code)) {
+    $code = '';
+  }
+
+  $options = array();
+  foreach (uc_order_status_list() as $status) {
+    $options[$status['id']] = $status['title'];
+  }
+
+  $form['start'] = array(
+    '#type' => 'date',
+    '#title' => t('Start date'),
+    '#default_value' => array('year' => format_date($start, 'custom', 'Y'), 'month' => format_date($start, 'custom', 'n'), 'day' => format_date($start, 'custom', 'j')),
+    '#after_build' => array('_uc_coupon_date_range'),
+  );
+  $form['end'] = array(
+    '#type' => 'date',
+    '#title' => t('End date'),
+    '#default_value' => array('year' => format_date($end, 'custom', 'Y'), 'month' => format_date($end, 'custom', 'n'), 'day' => format_date($end, 'custom', 'j')),
+    '#after_build' => array('_uc_coupon_date_range'),
+  );
+  $form['status'] = array(
+    '#type' => 'select',
+    '#title' => t('Order statuses'),
+    '#description' => t('Only orders with selected statuses will be included in the report.') .'<br />'. t('Hold Ctrl + click to select multiple statuses.'),
+    '#options' => $options,
+    '#default_value' => $statuses,
+    '#multiple' => TRUE,
+    '#size' => 5,
+  );
+
+  $form['code'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $code,
+    '#title' => t('Coupon Code'),
+    '#size' => 60,
+    '#maxlength' => 128
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Display report'),
+  );
+  return $form;
+}
+
+function kec_uc_coupon_reports_form_submit($form, &$form_state) {
+  $start = gmmktime(0, 0, 0, $form_state['values']['start']['month'], $form_state['values']['start']['day'], $form_state['values']['start']['year']);
+  $end = gmmktime(23, 59, 59, $form_state['values']['end']['month'], $form_state['values']['end']['day'], $form_state['values']['end']['year']);
+  $statuses = implode(',', array_keys($form_state['values']['status']));
+  $code = trim($form_state['values']['code']);
+
+  $form_state['redirect'] = 'admin/store/reports/coupon/'. $start .'/'. $end .'/'. $statuses . '/' . $code;
+}
+
+function kec_uc_coupon_reports($start = NULL, $end = NULL, $statuses = NULL, $code=NULL) {
+  drupal_add_css(drupal_get_path('module', 'uc_coupon') .'/reports.css', 'uc_coupon');
+
+  if (is_null($statuses)) {
+    $statuses = variable_get('uc_reports_reported_statuses', array('completed'));
+  }
+  else {
+    $statuses = explode(',', $statuses);
+  }
+
+  $output = drupal_get_form('kec_uc_coupon_reports_form', $start, $end, $statuses, $code);
+
+  if (isset($start) && isset($end)) {
+    if (!empty($code)) {
+      $query = db_query("SELECT co.cid, co.oid, co.value, co.code, o.order_total, o.created FROM {uc_coupons_orders} AS co LEFT JOIN {uc_orders} AS o ON (co.oid = o.order_id) WHERE o.created > %d AND o.created < %d AND o.order_status IN ('". implode("', '", $statuses) ."') AND co.code LIKE '%s' ORDER BY co.cid, o.created ASC", $start, $end, "%".$code."%");
+    } else {
+      $query = db_query("SELECT co.cid, co.oid, co.value, co.code, o.order_total, o.created FROM {uc_coupons_orders} AS co LEFT JOIN {uc_orders} AS o ON (co.oid = o.order_id) WHERE o.created > %d AND o.created < %d AND o.order_status IN ('". implode("', '", $statuses) ."') ORDER BY co.cid, o.created ASC", $start, $end);
+    }
+    $total = 0;
+
+    $row_header = array(t('Order #'), t('Purchase date'), t('Total'), t('Coupon value'));
+    $last_cid = 0;
+
+    while ($row = db_fetch_object($query)) {
+      // Display the table of coupons if this is the next set of coupons
+      if ($row->cid != $last_cid AND $last_cid != 0) {
+        $td[] = array('', '<b>'. t('Uses: @total', array('@total' => $num_uses)) .'</b>', '<b>'. uc_currency_format($coupon_sale_amount) .'</b>', '<b>'. uc_currency_format($coupon_amount) .'</b>');
+        $data .= theme('table', $row_header, $td, array('width' => '100%'));
+        $td = array();
+        $num_uses = 0;
+        $coupon_amount = 0;
+        $coupon_sale_amount = 0;
+      }
+      // if this is the first coupon of the set display the header first
+      if ($row->cid != $last_cid || $last_cid = 0) {
+        $data .= '<div class="totals">'. t('Coupon code: !link', array('!link' => l($row->code, 'admin/store/coupons/'. $row->cid .'/edit'))) .'</div>';
+      }
+      $td[] = array(l('#'. $row->oid, 'admin/store/orders/'. $row->oid), format_date($row->created, 'custom', variable_get('uc_date_format_default', 'm/d/Y')), uc_currency_format($row->order_total), uc_currency_format($row->value));
+      $num_uses++;
+      $coupon_amount += $row->value;
+      $coupon_sale_amount += $row->order_total;
+      $last_cid = $row->cid;
+      $orders_total += $row->order_total;
+      $coupons_total += $row->value;
+      $total++;
+    }
+    $td[] = array('', '<b>'. t('Uses: @total', array('@total' => $num_uses)) .'</b>', '<b>'. uc_currency_format($coupon_sale_amount) .'</b>', '<b>'. uc_currency_format($coupon_amount) .'</b>');
+    $data .= theme('table', $row_header, $td, array('width' => '100%'));
+
+    $output .= '<h2>'. t('Coupon usage report') .'</h2>';
+    $output .= $data;
+    $output .= '<br /><table width="100%"><tr>';
+    $output .= '<td>'. t('Coupons used: @total', array('@total' => $total)) .'</td>';
+    $output .= '<td>'. t('Orders total: @total', array('@total' => uc_currency_format($orders_total))) .'</td>';
+    $output .= '<td>'. t('Coupons total: @total', array('@total' => uc_currency_format($coupons_total))) .'</td>';
+    $output .= '</tr></table>';
+  }
+  return $output;
+}
+
+function kec_uc_coupon_add_form(&$form_state) {
+  _uc_coupon_paypal_check();
+
+  drupal_add_css(drupal_get_path('module', 'uc_coupon') . '/uc_coupon.css', 'module');
+  drupal_add_js(drupal_get_path('module', 'uc_coupon') .'/uc_coupon.admin.js');
+
+  $use_validity = FALSE;
+  $value = new stdClass();
+  $value->minimum_order = 0;
+  $value->data['apply_to'] = 'subtotal';
+  $value->max_uses = variable_get('uc_coupon_default_usage', 'single') == 'single' ? 1 : 0;
+  $used = 0;
+
+  if (!$use_validity) {
+    $value->valid_from = time();
+    $value->valid_until = time();
+  }
+
+  // Handle AHAH functionality.
+  $ahah_fields = array(
+    'products' => 'admin/store/coupons/autocomplete/node',
+    'skus' => '',
+    'terms' => 'admin/store/coupons/autocomplete/term',
+    'users' => 'admin/store/coupons/autocomplete/user',
+    'roles' => 'admin/store/coupons/autocomplete/role',
+  );
+
+  if (empty($form_state['ahah_submission'])) {
+    // Set the initial field count.
+    foreach (array_keys($ahah_fields) as $field) {
+      $form_state['storage']['field_count'][$field] = isset($value->data[$field]) ? (count($value->data[$field]) + 3) : 3;
+    }
+  }
+  else {
+    // Use data from the AHAH submission.
+    $value->data = $form_state['coupon_data'];
+
+    // Increase the count for the selected field.
+    $form_state['storage']['field_count'][$form_state['ahah_submission']] += 3;
+
+    // Reset form action, otherwise validation errors go wrong.
+    $form['#action'] = $form_state['action'];
+  }
+
+  foreach (array_keys($ahah_fields) as $field) {
+    if (!isset($value->data[$field])) {
+      $value->data[$field] = array();
+    }
+  }
+
+  $form['name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Coupon name prefix'),
+    '#default_value' => $value->name,
+    '#required' => TRUE,
+    '#weight' => -15,
+  );
+
+  $form['csv'] = array(
+    '#type' => 'textarea',
+    '#title' => 'CSV content',
+    '#required' => TRUE,
+    '#description' => 'CSV content as follow: Unique code, code value, status
+        (sold/blank until sold), purchaser email (blank until sold).
+        (One record per line, do not include the header)',
+  );
+
+  $form['status'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Coupon is active.'),
+    '#description' => t('Only active coupons can be used at checkout.'),
+    '#default_value' => $value->status,
+  );
+
+  $form['apply_to'] = array(
+    '#type' => 'radios',
+    '#title' => t('Apply discount to'),
+    '#options' => array(
+      'subtotal' => t('Order subtotal'),
+      'products_total' => t('Total of matching product(s)'),
+      'products' => t('All matching product(s)'),
+      'cheapest' => t('The cheapest matching product(s)'),
+      'expensive' => t('The most expensive matching product(s)'),
+    ),
+    '#description' => t('Coupons with no restrictions will match all products.'),
+    '#default_value' => $value->data['apply_to'],
+  );
+  $form['apply_count'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Maximum number of products to discount'),
+    '#default_value' => isset($value->data['apply_count']) ? $value->data['apply_count'] : '',
+    '#size' => 5,
+  );
+  $form['require_match_all'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Require all products to match'),
+    '#default_value' => isset($value->data['require_match_all']) ? TRUE : FALSE,
+    '#description' => t('If checked, the coupon will be rejected if an order contains any non-applicable products as configured below.'),
+  );
+
+  $form['use_validity'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Restrict coupon by date.'),
+    '#default_value' => $use_validity,
+  );
+  $zone = variable_get('uc_coupon_expiry_timezone', 0) ? '(local time)' : '(UTC)';
+  $hour = kec_uc_coupon_format_hour(variable_get('uc_coupon_expiry_hour', 0));
+  $link = l('store-wide coupon settings page', 'admin/store/settings/coupon', array('query' => array('destination' => $_GET['q'])));
+  $form['valid_from'] = array(
+    '#type' => 'date',
+    '#title' => t('Start date'),
+    '#default_value' => array(
+      'year' => kec_uc_coupon_format_date($value->valid_from, 'Y'),
+      'month' => kec_uc_coupon_format_date($value->valid_from, 'n'),
+      'day' => kec_uc_coupon_format_date($value->valid_from, 'j'),
+    ),
+    '#description' => t('Coupon will activate at @hour @zone on the specified date. The activation time/zone may be changed on the !link',
+      array('@hour' => $hour, '@zone' => $zone, '!link' => $link)),
+    '#after_build' => array('kec_uc_coupon_date_range'),
+  );
+  $form['valid_until'] = array(
+    '#type' => 'date',
+    '#title' => t('Expiry date'),
+    '#default_value' => array(
+      'year' => kec_uc_coupon_format_date($value->valid_until, 'Y'),
+      'month' => kec_uc_coupon_format_date($value->valid_until, 'n'),
+      'day' => kec_uc_coupon_format_date($value->valid_until, 'j'),
+    ),
+    '#description' => t('Coupon will expire at @hour @zone on the specified date. The expiration time/zone may be changed on the !link.',
+      array('@hour' => $hour, '@zone' => $zone, '!link' => $link)),
+    '#after_build' => array('kec_uc_coupon_date_range'),
+  );
+
+  $form['max_uses'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Maximum number of redemptions (per code)'),
+    '#default_value' => $value->max_uses ? $value->max_uses : '',
+    '#description' => t('If set, the coupon can only be used this number of times. For bulk coupons, this applies to each available code.'),
+    '#size' => 5,
+  );
+  $form['max_uses_per_user'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Maximum number of redemptions (per user)'),
+    '#default_value' => isset($value->data['max_uses_per_user']) ? $value->data['max_uses_per_user'] : '',
+    '#description' => t('If set, each user can only use the coupon this number of times.'),
+    '#size' => 5,
+  );
+
+  $form['order'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Minimum order limits'),
+    '#collapsible' => TRUE,
+    '#collapsed' => $value->minimum_order < 0.01 && !isset($value->data['minimum_qty']),
+  );
+  $form['order']['minimum_order'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Minimum order total'),
+    '#default_value' => $value->minimum_order < 0.01 ? '' : $value->minimum_order,
+    '#size' => 6,
+    '#description' => t('If set, the subtotal of products must be at least this amount for the coupon to be accepted.'),
+    '#field_prefix' => variable_get('uc_sign_after_amount', FALSE) ? '' : variable_get('uc_currency_sign', '$'),
+    '#field_suffix' => variable_get('uc_sign_after_amount', FALSE) ? variable_get('uc_currency_sign', '$') : '',
+  );
+  $form['order']['minimum_qty'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Minimum order quantity'),
+    '#default_value' => isset($value->data['minimum_qty']) ? $value->data['minimum_qty'] : '',
+    '#size' => 5,
+    '#description' => t('If set, at least this many products must be in the cart for the coupon to be accepted.'),
+  );
+  $form['order']['minimum_qty_restrict'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Only count applicable products'),
+    '#default_value' => isset($value->data['minimum_qty_restrict']) ? TRUE : FALSE,
+    '#description' => t('If checked, only applicable products as configured below will count towards the minimum quantity or total.'),
+  );
+
+  $form['product_types'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Applicable product classes'),
+    '#description' => t('Selecting a class will apply this coupon to <strong>all</strong> products of the class, overriding other restrictions except for products or terms explicitly excluded below.'),
+    '#collapsible' => TRUE,
+    '#collapsed' => empty($value->data['product_types']),
+  );
+  $form['product_types']['product_types'] = array(
+    '#type' => 'checkboxes',
+    '#options' => array_map('check_plain', array_intersect_key(node_get_types('names'), drupal_map_assoc(uc_product_types()))),
+    '#default_value' => isset($value->data['product_types']) ? $value->data['product_types'] : array(),
+  );
+
+  $form['products'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Applicable products'),
+    '#description' => t('Enter one or more products below to restrict this coupon to a set of products, regardless of any product attributes. Discounts will apply to each matching product.'),
+  );
+  $form['products']['negate_products'] = array(
+    '#type' => 'radios',
+    '#default_value' => isset($value->data['negate_products']) ? 1 : 0,
+    '#options' => array(
+      0 => t('Apply coupon to products listed below.'),
+      1 => t('Apply coupon to all products except those listed below.'),
+    ),
+    '#tree' => FALSE,
+  );
+  foreach ($value->data['products'] as $nid) {
+    $title = db_result(db_query('SELECT title FROM {node} WHERE nid = %d', $nid));
+    $form['products'][] = array(
+      '#type' => 'textfield',
+      '#default_value' => $title .' [nid:'. $nid .']',
+      '#autocomplete_path' => 'admin/store/coupons/autocomplete/node',
+      '#maxlength' => 300,
+    );
+  }
+
+  $form['skus'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Applicable SKUs'),
+    '#description' => t('Enter one or more SKUs below to restrict this coupon to a set of SKUs, allowing coupons to apply to specific products or attribute options. Discounts will apply to matching SKUs. Wildcards are supported, e.g. "E*" will match all products with SKUs beginning with E.'),
+  );
+  foreach ($value->data['skus'] as $sku) {
+    $form['skus'][] = array(
+      '#type' => 'textfield',
+      '#default_value' => $sku,
+    );
+  }
+
+  $form['terms'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Applicable taxonomy terms'),
+    '#description' => t('Enter one or more taxonomy terms (categories) below to restrict this coupon to a set of products. Discounts will apply to all matching products with these terms.'),
+  );
+  $form['terms']['negate_terms'] = array(
+    '#type' => 'radios',
+    '#default_value' => isset($value->data['negate_terms']) ? 1 : 0,
+    '#options' => array(
+      0 => t('Apply coupon to products with terms listed below.'),
+      1 => t('Apply coupon to all products except those with terms listed below.'),
+    ),
+    '#tree' => FALSE,
+  );
+  foreach ($value->data['terms'] as $tid) {
+    $name = db_result(db_query('SELECT name FROM {term_data} WHERE tid = %d', $tid));
+    $form['terms'][] = array(
+      '#type' => 'textfield',
+      '#default_value' => $name .' [tid:'. $tid .']',
+      '#autocomplete_path' => 'admin/store/coupons/autocomplete/term',
+      '#maxlength' => 300, // leave room for the [tid=%] suffix
+    );
+  }
+
+  $form['users'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('User restrictions'),
+    '#description' => t('Enter one or more user names and/or "anonymous users" below to restrict this coupon by user.'),
+  );
+  $form['users']['negate_users'] = array(
+    '#type' => 'radios',
+    '#default_value' => isset($value->data['negate_users']) ? 1 : 0,
+    '#options' => array(
+      0 => t('Allow this coupon only for users listed below.'),
+      1 => t('Allow this coupon for all users except those listed below.'),
+    ),
+    '#tree' => FALSE,
+  );
+  foreach ($value->data['users'] as $uid) {
+    $username = $uid ? db_result(db_query('SELECT name FROM {users} WHERE uid = %d', $uid)) : t('anonymous users');
+    $form['users'][] = array(
+      '#type' => 'textfield',
+      '#default_value' => $username .' [uid:'. $uid .']',
+      '#autocomplete_path' => 'admin/store/coupons/autocomplete/user',
+    );
+  }
+
+  $form['roles'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Role restrictions'),
+    '#description' => t('Enter one or more role names below to restrict this coupon based on a user\'s roles.'),
+  );
+  $form['roles']['negate_roles'] = array(
+    '#type' => 'radios',
+    '#default_value' => isset($value->data['negate_roles']) ? 1 : 0,
+    '#options' => array(
+      0 => t('Allow this coupon only for users with the roles listed below.'),
+      1 => t('Allow this coupon for users with all roles except those listed below.'),
+    ),
+    '#tree' => FALSE,
+  );
+  foreach ($value->data['roles'] as $role) {
+    $form['roles'][] = array(
+      '#type' => 'textfield',
+      '#default_value' => $role,
+      '#autocomplete_path' => 'admin/store/coupons/autocomplete/role',
+    );
+  }
+
+  // Add common settings and AHAH functionality to restriction fieldsets.
+  foreach ($ahah_fields as $field => $path) {
+    $form[$field] = array_merge($form[$field], array(
+      '#tree' => TRUE,
+      '#collapsible' => TRUE,
+      '#collapsed' => empty($value->data[$field]) && empty($form_state['ahah_submission']),
+      '#prefix' => '<div id="ahah-' . $field . '">',
+      '#suffix' => '</div>',
+      'more_' . $field => array(
+        '#type' => 'submit',
+        '#value' => t('Add more items'),
+        '#weight' => 1,
+        '#ahah' => array(
+          'path' => 'admin/store/coupons/ahah/' . $field,
+          'wrapper' => 'ahah-' . $field,
+          'effect' => 'fade',
+        ),
+        '#tree' => FALSE,
+      ),
+    ));
+
+    // Add blank fields if needed.
+    for ($i = count($value->data[$field]); $i < $form_state['storage']['field_count'][$field]; $i++) {
+      $form[$field][] = array(
+        '#type' => 'textfield',
+        '#autocomplete_path' => $path ? $path : NULL,
+        '#maxlength' => ($field=='products' || $field=='terms') ? 300 : 128,
+      );
+    }
+  }
+
+  $form['deprecated'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Deprecated options'),
+    '#description' => t('These options will be removed in a future version.'),
+    '#collapsible' => TRUE,
+    '#collapsed' => !isset($value->data['wholesale']) || $value->data['wholesale'] == 1,
+  );
+  $form['deprecated']['wholesale'] = array(
+    '#type' => 'radios',
+    '#title' => t('Wholesale permissions'),
+    '#description' => t('Select the groups who are able to use this coupon. It is recommended that you leave this option as "Both wholesale and retail" use the role selection above instead.'),
+    '#default_value' => isset($value->data['wholesale']) ? $value->data['wholesale'] : 1,
+    '#options' => array(
+      '1' => t('Both wholesale and retail'),
+      '2' => t('Wholesale buyers only'),
+      '3' => t('Retail buyers only')
+    ),
+    '#required' => TRUE,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save coupon'),
+    '#weight' => 10,
+  );
+  return $form;
+}
+
+function kec_uc_coupon_add_form_validate($form, &$form_state) {
+  drupal_add_css(drupal_get_path('module', 'uc_coupon') . '/uc_coupon.css', 'module');
+  drupal_add_js(drupal_get_path('module', 'uc_coupon') .'/uc_coupon.admin.js');
+
+  if ($form_state['values']['apply_to'] == 'cheapest' || $form_state['values']['apply_to'] == 'expensive') {
+    if (!preg_match('/^[1-9]\d*$/', $form_state['values']['apply_count'])) {
+      form_set_error('apply_count', t('You must specify the maximum number of products to discount.'));
+    }
+  }
+
+  foreach ($form_state['values']['products'] as $key => $product) {
+    if ($product && !preg_match('/\[nid:(\d+)\]$/', $product)) {
+      form_set_error('products]['. $key, t('Products must include the node ID.'));
+    }
+  }
+
+  foreach ($form_state['values']['users'] as $key => $user) {
+    if ($user && !preg_match('/\[uid:(\d+)\]$/', $user)) {
+      form_set_error('users]['. $key, t('User names must include the user ID.'));
+    }
+  }
+
+  if ($form_state['values']['use_validity']) {
+    $valid_from = kec_uc_coupon_mktime($form_state['values']['valid_from']['month'], $form_state['values']['valid_from']['day'], $form_state['values']['valid_from']['year']);
+    $valid_until = kec_uc_coupon_mktime($form_state['values']['valid_until']['month'], $form_state['values']['valid_until']['day'], $form_state['values']['valid_until']['year']);
+    if ($valid_from > $valid_until) {
+      form_set_error('valid_from', t('The coupon start date must be before the expiration date.'));
+    }
+  }
+}
+
+function kec_uc_coupon_add_form_submit($form, &$form_state) {
+
+  $csv = $form_state['values']['csv'];
+  $lines = preg_split('/\R/', $csv);
+  $count = 0;
+  $duplicated = array();
+  foreach ($lines as $line) {
+    $line = trim($line);
+    $values = str_getcsv($line, " ");
+    if (count($values) == 1) {
+      $values = str_getcsv($line, ",");
+    }
+    if (count($values) == 1) {
+      $values = str_getcsv($line, "\t");
+    }
+    $code = trim(@$values[0]);
+    $discount = trim(@$values[1]);
+    $discount = str_replace("$", "", $discount);
+    $status = trim(@$values[2]);
+    $purchaser_email = trim(@$values[3]);
+
+    $coupon = new stdClass;
+
+    // Set basic coupon information.
+    $coupon->name = $form_state['values']['name'] . "_" . $code;
+    $coupon->code = strtoupper($code);
+
+    $check_coupon = db_query('SELECT * FROM {uc_coupons} c WHERE c.code = "%s"', $coupon->code);
+    $check_coupon = db_fetch_object($check_coupon);
+    if ($check_coupon) {
+      $duplicated[] = $line;
+      continue;
+    }
+
+    if ($form_state['values']['use_validity']) {
+      $coupon->valid_from = kec_uc_coupon_mktime($form_state['values']['valid_from']['month'], $form_state['values']['valid_from']['day'], $form_state['values']['valid_from']['year']);
+      $coupon->valid_until = kec_uc_coupon_mktime($form_state['values']['valid_until']['month'], $form_state['values']['valid_until']['day'], $form_state['values']['valid_until']['year']);
+    }
+    else {
+      $coupon->valid_from = $coupon->valid_until = 0;
+    }
+    $coupon->status = $form_state['values']['status'];
+    $coupon->type = 'price';
+    if (substr($discount, -1) == '%') {
+      $coupon->type = 'percentage';
+    }
+    if (substr($discount, 0, 1) == '=') {
+      $coupon->type = 'set_price';
+    }
+    $coupon->value = str_replace(array('%', '='), '', $discount);
+    $coupon->minimum_order = $form_state['values']['minimum_order'] ? $form_state['values']['minimum_order'] : 0;
+    $coupon->data['minimum_qty'] = $form_state['values']['minimum_qty'];
+    $coupon->data['minimum_qty_restrict'] = $form_state['values']['minimum_qty_restrict'];
+    $coupon->data['require_match_all'] = $form_state['values']['require_match_all'];
+    $coupon->max_uses = $form_state['values']['max_uses'] ? $form_state['values']['max_uses'] : 0;
+    $coupon->data['max_uses_per_user'] = $form_state['values']['max_uses_per_user'];
+    $coupon->data['apply_to'] = $form_state['values']['apply_to'];
+    if ($form_state['values']['apply_to'] == 'cheapest' || $form_state['values']['apply_to'] == 'expensive') {
+      $coupon->data['apply_count'] = $form_state['values']['apply_count'];
+    }
+
+    // Map restrictions back to their IDs.
+    array_walk($form_state['values']['products'], 'kec_uc_coupon_map_restriction', 'nid');
+    array_walk($form_state['values']['terms'], 'kec_uc_coupon_map_restriction', 'tid');
+    array_walk($form_state['values']['users'], 'kec_uc_coupon_map_restriction', 'uid');
+
+    // Set coupon restrictions.
+    $coupon->data['product_types'] = drupal_map_assoc(array_filter($form_state['values']['product_types']));
+    $coupon->data['negate_products'] = $form_state['values']['negate_products'];
+    $coupon->data['products'] = drupal_map_assoc(array_filter($form_state['values']['products']));
+    $coupon->data['skus'] = drupal_map_assoc(array_filter($form_state['values']['skus']));
+    $coupon->data['negate_terms'] = $form_state['values']['negate_terms'];
+    $coupon->data['terms'] = drupal_map_assoc(array_filter($form_state['values']['terms']));
+    $coupon->data['negate_users'] = $form_state['values']['negate_users'];
+    $coupon->data['users'] = drupal_map_assoc(array_filter($form_state['values']['users'], 'is_numeric'));
+    $coupon->data['negate_roles'] = $form_state['values']['negate_roles'];
+    $coupon->data['roles'] = drupal_map_assoc(array_filter($form_state['values']['roles']));
+    $coupon->data['wholesale'] = $form_state['values']['wholesale'];
+    $coupon->data['purchaser_email'] = $purchaser_email;
+    $coupon->data['sale_status'] = $status;
+
+    // Remove zero values and empty arrays.
+    $coupon->data = array_filter($coupon->data);
+
+    // Handle AHAH submissions.
+    if (!empty($form_state['ahah_submission'])) {
+      $form_state['coupon_data'] = $coupon->data;
+      return;
+    }
+    // Clear AHAH storage, or the redirect will fail.
+    unset($form_state['storage']['field_count']);
+
+    uc_coupon_save($coupon, $form_state['values']);
+    $count ++;
+  }
+
+  drupal_set_message(t('%count record(s) imported successfully.', array('%count' => $count)));
+  drupal_set_message(t('%count duplicate record(s) were not imported:', array('%count' => count($duplicated))));
+  foreach ($duplicated as $line) {
+    drupal_set_message(t('%line', array('%line' => $line)));
+  }
+
+  watchdog('Import Coupons', $count . " record(s) imported successfully.<br/>".
+      count($duplicated) . " duplicate record(s) were not imported:<br/>".
+      implode("<br/>", $duplicated));
+}
+
+function kec_uc_coupon_display_form(&$form_state) {
+  kec_uc_coupon_paypal_check();
+
+  $view_type = isset($_REQUEST['view_type']) ? $_REQUEST['view_type'] : 'active';
+  $code = trim(@$_REQUEST['code']);
+
+  $header = array(
+    array('data' => t('Actions')),
+    array('data' => t('Name'), 'field' => 'name'),
+    array('data' => t('Code'), 'field' => 'code', 'sort' => 'asc'),
+    array('data' => t('Value'), 'field' => 'value'),
+    array('data' => t('Created'), 'field' => 'created'),
+    array('data' => t('Valid from'), 'field' => 'valid_from'),
+    array('data' => t('Valid until'), 'field' => 'valid_until'),
+  );
+
+  if (!empty($code)) {
+    $result = pager_query('SELECT * FROM {uc_coupons} WHERE code LIKE "%s" AND status = %d'. tablesort_sql($header), 20, 0, NULL, "%$code%", $view_type == 'inactive' ? 0 : 1);
+  } else {
+    $result = pager_query('SELECT * FROM {uc_coupons} WHERE status = %d'. tablesort_sql($header), 20, 0, NULL, $view_type == 'inactive' ? 0 : 1);
+  }
+
+  $rows = array();
+  while ($coupon = db_fetch_object($result)) {
+    $coupon->data = $coupon->data ? unserialize($coupon->data) : array();
+    $rows[] = array(
+      theme('uc_coupon_actions', $coupon),
+      check_plain($coupon->name),
+      check_plain($coupon->code) . ($coupon->bulk ? '* '. t('(bulk)') : ''),
+      uc_coupon_format_discount($coupon),
+      kec_uc_coupon_format_date($coupon->created, variable_get('uc_date_format_default', 'm/d/Y')),
+      $coupon->valid_from ? kec_uc_coupon_format_date($coupon->valid_from, variable_get('uc_date_format_default', 'm/d/Y H:iT')) : '-',
+      $coupon->valid_until ? kec_uc_coupon_format_date($coupon->valid_until, variable_get('uc_date_format_default', 'm/d/Y H:iT')) : '-',
+    );
+  }
+
+  if (count($rows)) {
+    $output = theme('table', $header, $rows, array('width' => '100%'));
+    $output .= theme('pager', NULL, 20);
+  }
+  else {
+    switch ($view_type) {
+      case 'active':
+        $output = '<p>'. t('There are currently no active coupons in the system.') .'</p>';
+        break;
+      case 'inactive':
+        $output = '<p>'. t('There are currently no inactive coupons in the system.') .'</p>';
+        break;
+    }
+  }
+
+  $output .= '<p>'. l(t('Add a new coupon.'), 'admin/store/coupons/add') .'</p>';
+
+  $form['filter'] = array(
+    '#type' => 'fieldset',
+  );
+
+  $form['filter']['view_type'] = array(
+    '#type' => 'select',
+    '#title' => 'View type',
+    '#default_value' => $view_type,
+    '#options' => array(
+      'active' => t('Active'),
+      'inactive' => t('Inactive'),
+    ),
+    '#tree' => FALSE,
+  );
+
+  $form['filter']['code'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $code,
+    '#title' => t('Coupon Code'),
+    '#size' => 60,
+    '#maxlength' => 128
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Search'),
+  );
+
+  $form['#suffix'] = $output;
+
+  return $form;
+}
+
+function kec_uc_coupon_display_form_submit($form, &$form_state) {
+  $code = $form_state['values']['code'];
+  $view_type = $form_state['values']['view_type'];
+  drupal_goto('admin/store/coupons', array('code' => $code, 'view_type' => $view_type));
+}
+
+function kec_uc_coupon_paypal_check() {
+  if (variable_get('uc_payment_method_paypal_wps_checkout', 0) && variable_get('uc_paypal_wps_submit_method', 'single') == 'itemized') {
+    drupal_set_message(t('To use coupons with PayPal you must select "Submit the whole order as a single line item". <a href="!url">Click here to change this setting</a>.', array('!url' => url('admin/store/settings/payment/edit/methods'))));
+  }
+}
+
+function kec_uc_coupon_map_restriction(&$value, $key, $prefix) {
+  if ($value && preg_match('/\[' . $prefix . ':(\d+)\]$/', $value, $matches)) {
+    $value = $matches[1];
+  }
+  else {
+    $value = FALSE;
+  }
+}
+
+function kec_uc_coupon_mktime($month, $day, $year) {
+  $func = variable_get('uc_coupon_expiry_timezone', 0) ? 'mktime' : 'gmmktime';
+  $hour = variable_get('uc_coupon_expiry_hour', 0);
+  $time = $func($hour, 0, 0, $month, $day, $year);
+  //dpm($time . ' ' . date('m/d/y h:i:s T', $time), 'using ' . $func . '(' . $hour . ')');
+  return $func($hour, 0, 0, $month, $day, $year);
+
+}
+
+function kec_uc_coupon_format_hour($hour) {
+  return sprintf("%02d:00", $hour);
+}
+
+function kec_uc_coupon_format_date($date, $format) {
+  $func = variable_get('uc_coupon_expiry_timezone', 0) ? 'date' : 'gmdate';
+  return $func($format, $date);
+}
+
+function kec_uc_coupon_date_range($form_element) {
+  $form_element['year']['#options'] = drupal_map_assoc(range(2008, 2020));
+  return $form_element;
+}
